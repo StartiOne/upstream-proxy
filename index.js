@@ -9,7 +9,8 @@
 */
 const net = require('net');
 const xpipe = require('xpipe');
-const sni = require('sni');
+const HttpMessageParser = require('./HttpMessageParser');
+const Transform = require('stream').Transform;
 
 /**
  * Creates a new upstream proxy instance.
@@ -31,6 +32,16 @@ class UpstreamProxy {
     this.symHostHeader = Symbol('host_header');
     this.host_headers = {};
     this.sockets = new Map();
+    this.requestInterceptors = [];
+    this.responseInterceptors = [];
+    this.routeResolver = (message) => {
+      let hostHeader = message.headers.host.split(':')[0];
+      let route = this.routes.get(hostHeader);
+      if (!route) {
+        route = this.routes.get('*');
+      }
+      return route;
+    }
 
     this.status_codes = new Map([
       [400, 'Bad Request'],
@@ -42,13 +53,13 @@ class UpstreamProxy {
 
     try {
       this.config = config;
-      this.routes = this._generateRoutesMap(this.config); 
-    } 
+      this.routes = this._generateRoutesMap(this.config);
+    }
     catch(e) {};
 
     try {
       this.callbacks = callbacks;
-    } 
+    }
     catch(e) {};
 
     let server = net.createServer((socket) => this._handleConnection(socket));
@@ -62,8 +73,23 @@ class UpstreamProxy {
     server.setCallbacks = (callbacks) => this.setCallbacks(callbacks);
     server.disconnectClients = (host) => this.disconnectClients(host);
     server.disconnectAllClients = () => this.disconnectAllClients();
+    server.addRequestInterceptor = (fn) => this.addRequestInterceptor(fn);
+    server.addResponseInterceptor = (fn) => this.addResponseInterceptor(fn);
+    server.setRouteResolver = (fn) => this.setRouteResolver(fn);
 
     return server;
+  }
+
+  addRequestInterceptor(fn) {
+    this.requestInterceptors.push(fn);
+  }
+
+  addResponseInterceptor(fn) {
+    this.responseInterceptors.push(fn);
+  }
+
+  setRouteResolver(fn) {
+    this.routeResolver = fn;
   }
 
   /**
@@ -75,12 +101,26 @@ class UpstreamProxy {
       return socket.end(this._httpResponse(503));
     }
 
-    socket.once('error', (err) => {
-      //console.log(err);
-      socket.end();
+    var parser = new HttpMessageParser('request');
+
+    socket.once('data', (buffer) => {
+      var ret = parser.execute(buffer, 0, buffer.length);
+      if (ret instanceof Error) {
+        parser.emit('error');
+      }
     });
 
-    socket.once('data', (data) => this._handleData(socket, data));
+    parser.once('headers', (request) => {
+      this._handleRequest(socket, request);
+    });
+
+    parser.on('error', () => {
+      socket.end(this._httpResponse(400));
+    });
+
+    socket.once('error', (err) => {
+      socket.end();
+    });
   }
 
   /**
@@ -88,19 +128,13 @@ class UpstreamProxy {
    * @param {Object} socket
    * @param {Buffer} data
    */
-  _handleData(socket, data) {
-    if (data instanceof Buffer === false || data.length < 1) {
-      return socket.end(this._httpResponse(400));
-    }
-    let host_header = this._getHostHeader(data);
-    let route = this.routes.get(host_header);
+  _handleRequest(socket, message) {
+    let host_header = '*';
+    let route = this.routeResolver(message);
     if (!route) {
-      route = this.routes.get('*');
-      if (!route) {
-        return socket.end(this._httpResponse(404));
-      }
-      host_header = '*';
+      return socket.end(this._httpResponse(404));
     }
+    host_header = route.host;
 
     let backend = new net.Socket();
 
@@ -116,29 +150,104 @@ class UpstreamProxy {
 
     backend.on('connect', () => {
       this._addConnection(socket, host_header);
-      socket.on('error', () => { this._removeConnection(socket, backend); });
-      backend.on('close', () => { this._removeConnection(socket, backend); });
-      backend.write(data);
-      socket.pipe(backend).pipe(socket);
+      socket.on('error', () => { this._removeConnection(socket, backend) });
+      backend.on('close', () => { this._removeConnection(socket, backend) });
+      backend.write(this._makeBufferFromHttpMessage(this._handleRequestInterceptors(message)));
+      let handler = {
+        protocol: 'http'
+      }
+      socket
+        .pipe(this._makeHttpParserStream('request', handler))
+        .pipe(backend)
+        .pipe(this._makeHttpParserStream('response', handler))
+        .pipe(socket);
     });
 
     backend.connect(route);
   }
 
-  /**
-   * Extracts hostname from buffer
-   * @param {Buffer} data
-   * @return {string}
-   */
-  _getHostHeader(data) {
-    if (data[0] === 22) { //secure
-      return this.routes.get(sni(data));
+  _makeBufferFromHttpMessage(message) {
+    let lines = []
+    let httpVersion = 'HTTP/' + message.versionMajor + '.' + message.versionMinor
+    if (message.statusCode) {
+      lines.push(httpVersion + ' ' + message.statusCode + ' ' + message.statusMessage)
     } else {
-      let result = data.toString('utf8').match(/^(H|h)ost: (\[[^\]]*\]|[^ \:\r\n]+)/im);
-      if (result) {
-        return result[2];
-      }
+      lines.push(message.method + ' ' + message.url + ' ' + httpVersion)
     }
+    for (var headerKey in message.headers) {
+      lines.push(headerKey + ': ' + message.headers[headerKey])
+    }
+    return Buffer.from(
+      lines.join('\r\n') + '\r\n' + '\r\n',
+      'utf-8'
+    )
+  }
+
+  _makeHttpParserStream (type, handler) {
+      let ts = new Transform();
+      let chunks = [], len = 0;
+      let parser = new HttpMessageParser(type);
+      let interceptorMethod = type == 'request' ? '_handleRequestInterceptors' : '_handleResponseInterceptors';
+
+      ts._transform = function _transform (chunk, enc, cb) {
+        if (handler.protocol == 'http') {
+          let ret = parser.execute(chunk, 0, chunk.length)
+          if (ret instanceof Error) {
+            parser.emit('error')
+          }
+          len += chunk.length;
+          chunks.push(chunk);
+        } else {
+          ts.push(chunk);
+        }
+        cb(null);
+      };
+
+      ts._flush = function _flush(cb) {
+        if (chunks.length) {
+          let buffer = Buffer.concat(chunks, len);
+          ts.push(buffer);
+          chunks = [];
+          len = 0;
+        }
+        cb(null);
+      }
+
+      parser.on('headers', (message) => {
+        chunks = [];
+        len = 0;
+        ts.push(this._makeBufferFromHttpMessage(this[interceptorMethod](message)));
+        if (message.statusCode === 101) {
+          handler.protocol = message.headers.upgrade;
+        }
+      });
+
+      parser.on('body', (buffer, offset, length) => {
+        chunks = [];
+        len = 0;
+        buffer = offset ? buffer.slice(offset) : buffer;
+        ts.push(buffer);
+      });
+
+      parser.on('error', function () {
+        ts._flush(function () {});
+      });
+
+      return ts;
+  }
+
+  _handleRequestInterceptors(request) {
+    for (var fn of this.requestInterceptors) {
+      fn(request);
+    }
+    return request;
+  }
+
+  _handleResponseInterceptors(response) {
+    for (var fn of this.responseInterceptors) {
+      fn(response);
+    }
+    return response;
   }
 
   /**
@@ -150,6 +259,9 @@ class UpstreamProxy {
     this.id++;
     socket[this.symId] = this.id;
     socket[this.symHostHeader] = host_header;
+    if (! this.host_headers[host_header]) {
+      this.host_headers[host_header] = new Map();
+    }
     this.host_headers[host_header].set(this.id, true);
     this.sockets.set(this.id, socket);
   }
@@ -183,7 +295,6 @@ class UpstreamProxy {
         for (let host of hosts) {
           if (obj.endpoint) {
             routes.set(host, obj.endpoint);
-            this.host_headers[host] = new Map();
           }
         }
       }
@@ -205,7 +316,7 @@ class UpstreamProxy {
         i++;
       } catch (e) {
         //console.log(e);
-      }  
+      }
     }
     return i;
   }
